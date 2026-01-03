@@ -1,4 +1,4 @@
-CFLAGS += -g -O2 -fopenmp
+CFLAGS += -g -fopenmp
 LDLIBS += -lgmp
 
 pi: pi.c

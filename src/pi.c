@@ -6,11 +6,17 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <stdarg.h>
+#include <omp.h>
+#include <time.h>
 
 // log_2(10)
 #define BITS_PER_DIGIT 3.3219280949
 
+// flag for verbose output
 int verbose;
+
+// flag for outputting elapsed time
+int print_time;
 
 /**
  * Prints a debugging message to stderr only if the the verbose option is given
@@ -23,6 +29,29 @@ void debug(const char* fmt, ...) {
         vfprintf(stderr, fmt, ap);
         va_end(ap);
     }
+}
+
+/**
+ * Combine two pqr results. Outputs should not be the same as inputs.
+ */
+void pqr_combine(mpz_t r_p, mpz_t r_q, mpz_t r_r,
+    mpz_t pam, mpz_t qam, mpz_t ram,
+    mpz_t pmb, mpz_t qmb, mpz_t rmb) {
+    mpz_t p, q, r, pam_rmb;
+    mpz_inits(p, q, r, pam_rmb, NULL);
+    // Pab = Pam * Pmb
+    // Qab = Qam * Qmb
+    // Rab = Qmb * Ram + Pam * Rmb
+    mpz_mul(p, pam, pmb);
+    mpz_mul(q, qam, qmb);
+    mpz_mul(r, qmb, ram);
+    // pam_rmb = pam * rmb
+    mpz_mul(pam_rmb, pam, rmb);
+    mpz_add(r, r, pam_rmb);
+    mpz_set(r_p, p);
+    mpz_set(r_q, q);
+    mpz_set(r_r, r);
+    mpz_clears(p, q, r, pam_rmb, NULL);
 }
 
 /**
@@ -63,29 +92,54 @@ void binary_split(mpz_t r_p, mpz_t r_q, mpz_t r_r, long a, long b) {
         mpz_inits(pam, qam, ram, pmb, qmb, rmb, NULL);
         binary_split(pam, qam, ram, a, m);
         binary_split(pmb, qmb, rmb, m, b);
-        
-        // Pab = Pam * Pmb
-        // Qab = Qam * Qmb
-        // Rab = Qmb * Ram + Pam * Rmb
-        mpz_mul(r_p, pam, pmb);
-        mpz_mul(r_q, qam, qmb);
-        mpz_mul(r_r, qmb, ram);
-        // also, pam = pam * rmb
-        mpz_mul(pam, pam, rmb);
-        mpz_add(r_r, r_r, pam);
+        pqr_combine(r_p, r_q, r_r, pam, qam, ram, pmb, qmb, rmb);
         mpz_clears(pam, qam, ram, pmb, qmb, rmb, NULL);
     }
 }
 
-void chudnovsky(mpf_t r_pi, long n, int nthreads) {
+/**
+ * Calculate Pi with `n` iterations and a maximum of `thread` threads.
+ */
+void chudnovsky(mpf_t r_pi, long n, int threads) {
     // (426880 * sqrt(10005) * Q(1, n)) / (13591409 * Q(1, n) + R(1, n))
     // to retain accuracy, denominator is initially an integer
-    mpz_t p, q, r;
     mpf_t den, f_q;
-    mpz_inits(p, q, r, NULL);
     mpf_inits(den, f_q, NULL);
     debug("start binary split\n");
-    binary_split(p, q, r, 1, n + 1);
+
+    // multithreaded implementation for binary split
+    if (n < threads * 2) threads = 1;
+    long interval = n / threads;
+    debug("interval: %ld\n", interval);
+    mpz_t p_vals[threads];
+    mpz_t q_vals[threads];
+    mpz_t r_vals[threads];
+
+    #pragma omp parallel for num_threads(threads)
+    for (int i = 0; i < threads; i++) {
+        long start = i * interval + 1;
+        long end = (i == threads - 1) ? n : (i + 1) * interval + 1;
+        mpz_inits(p_vals[i], q_vals[i], r_vals[i], NULL);
+        binary_split(p_vals[i], q_vals[i], r_vals[i], start, end);
+    }
+
+    debug("performing reduction\n");
+    mpz_t p, q, r;
+    mpz_inits(p, q, r, NULL);
+    if (threads > 1) {
+        // perform reduction by combining values with first
+        for (int i = 1; i < threads; i++) {
+            pqr_combine(p_vals[0], q_vals[0], r_vals[0],
+                p_vals[0], q_vals[0], r_vals[0],
+                p_vals[i], q_vals[i], r_vals[i]);
+            mpz_clears(p_vals[i], q_vals[i], r_vals[i], NULL);
+        }
+    }
+    mpz_set(p, p_vals[0]);
+    mpz_set(q, q_vals[0]);
+    mpz_set(r, r_vals[0]);
+    mpz_clears(p_vals[0], q_vals[0], r_vals[0], NULL);
+    
     debug("combining values\n");
     // numerator = (426880 * sqrt(10005) * q)
     mpf_set_z(f_q, q);
@@ -103,12 +157,17 @@ void chudnovsky(mpf_t r_pi, long n, int nthreads) {
     mpf_clears(den, f_q, NULL);
 }
 
+/**
+ * Prints program usage to stderr.
+ */
 static void usage(char* name) {
     fprintf(stderr,
-            "Usage: %s [-vqh] PREC\n"
+            "Usage: %s [-vqh] [-n THREADS] PREC\n"
                 "Options:\n"
                 " -v\tshow verbose (debug) messages\n"
                 " -q\tdon't print result\n"
+                " -t\tprint time taken\n"
+                " -n\tspecify number of threads to use\n"
                 " -h\tprint help then exit\n"
                 " PREC\tnumber of decimal points to calculate (must be non-negative)\n",
             name);
@@ -120,7 +179,10 @@ int main(int argc, char** argv) {
     int opt;
     opterr = 0;
     verbose = 0;
-    while ((opt = getopt(argc, argv, "vqh")) != -1) {
+    print_time = 0;
+    int threads = omp_get_max_threads();
+    char* nvalue = 0;
+    while ((opt = getopt(argc, argv, "vqhtn:")) != -1) {
         switch (opt) {
             case 'v':
                 verbose = 1;
@@ -128,11 +190,19 @@ int main(int argc, char** argv) {
             case 'q':
                 quiet = 1;
                 break;
+            case 't':
+                print_time = 1;
+                break;
+            case 'n':
+                nvalue = optarg;
+                break;
             case 'h':
                 usage(basename(argv[0]));
                 exit(EXIT_SUCCESS);
             case '?':
-                if (isprint(optopt)) {
+                if (optopt == 'n') {
+                    fprintf(stderr, "Option -%c requires an argument", optopt);
+                } else if (isprint(optopt)) {
                     fprintf(stderr, "Unknown option '%c'\n", optopt);
                 } else {
                     fprintf(stderr, "Unknown character %x\n", optopt);
@@ -144,24 +214,38 @@ int main(int argc, char** argv) {
     }
     if (optind == argc) {
         // no positional arguments
-        debug("No positional args\n");
+        debug("no positional args\n");
         usage(basename(argv[0]));
         exit(EXIT_FAILURE);
     }
     char* err = 0;
+    if (nvalue) {
+        debug("-n specified\n");
+        threads = strtol(nvalue, &err, 10);
+        if (*err || threads < 1) {
+            usage(basename(argv[0]));
+            exit(EXIT_FAILURE);    
+        }
+    }
     prec = strtol(argv[optind], &err, 10);
     if (*err || prec < 0) {
         usage(basename(argv[0]));
         exit(EXIT_FAILURE);
     }
     debug("precision: %d\n", prec);
+    debug("max number of threads: %d\n", threads);
 
     long prec_bits = (prec + 2) * BITS_PER_DIGIT;
     mpf_set_default_prec(prec_bits);
     mpf_t pi;
     mpf_init(pi);
     int n = prec / 14 > 1 ? prec / 14 + 1 : 2;
-    chudnovsky(pi, n, 1);
+    clock_t start = clock();
+    chudnovsky(pi, n, threads);
+    double duration = (double)(clock() - start) / CLOCKS_PER_SEC;
+    if (print_time) {
+        printf("%lf\n", duration);
+    }
     if (!quiet) {
         gmp_printf("%.*Ff\n", prec, pi);
     }
