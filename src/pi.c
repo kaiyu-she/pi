@@ -7,7 +7,6 @@
 #include <libgen.h>
 #include <stdarg.h>
 #include <omp.h>
-#include <time.h>
 
 // log_2(10)
 #define BITS_PER_DIGIT 3.3219280949
@@ -110,13 +109,14 @@ void chudnovsky(mpf_t r_pi, long n, int threads) {
     // multithreaded implementation for binary split
     if (n < threads * 2) threads = 1;
     long interval = n / threads;
+    omp_set_num_threads(threads);
     debug("interval: %ld\n", interval);
     int num_vals = threads;
     mpz_t* p_vals = malloc(num_vals * sizeof(mpz_t));
     mpz_t* q_vals = malloc(num_vals * sizeof(mpz_t));
     mpz_t* r_vals = malloc(num_vals * sizeof(mpz_t));
 
-    #pragma omp parallel for num_threads(threads)
+    #pragma omp parallel for
     for (int i = 0; i < num_vals; i++) {
         long start = i * interval + 1;
         long end = (i == num_vals - 1) ? n : (i + 1) * interval + 1;
@@ -134,7 +134,7 @@ void chudnovsky(mpf_t r_pi, long n, int threads) {
         mpz_t* new_q_vals = malloc(new_num_vals * sizeof(mpz_t));
         mpz_t* new_r_vals = malloc(new_num_vals * sizeof(mpz_t));
         
-        #pragma omp parallel for num_threads(threads)
+        #pragma omp parallel for
         for (int i = 0; i < num_vals - 1; i += 2) {
             int new_i = i / 2;
             mpz_inits(new_p_vals[new_i], new_q_vals[new_i], new_r_vals[new_i], NULL);
@@ -268,9 +268,9 @@ int main(int argc, char** argv) {
     mpf_t pi;
     mpf_init(pi);
     int n = prec / 14 > 1 ? prec / 14 : 2;
-    clock_t start = clock();
+    double start_time = omp_get_wtime();
     chudnovsky(pi, n, threads);
-    double duration = (double)(clock() - start) / CLOCKS_PER_SEC;
+    double duration = omp_get_wtime() - start_time;
     if (print_time) {
         printf("%lf\n", duration);
     }
